@@ -1,0 +1,9 @@
+/docs/
+/lib/
+/bin/
+/.shards/
+*.dwarf
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db

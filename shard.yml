@@ -1,0 +1,17 @@
+name: sqlq
+version: 0.1.0
+
+authors:
+  - Paul M. Lambert <plambert@plambert.net>
+
+targets:
+  sqlq:
+    main: src/sqlq.cr
+
+dependencies:
+  sqlite3:
+    github: crystal-lang/crystal-sqlite3
+
+crystal: '>= 1.16.3'
+
+license: MIT
