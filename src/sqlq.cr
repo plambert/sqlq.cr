@@ -40,7 +40,7 @@ module Queue
         when "--localtime"
           @timezone = Time::Location.local
         when "--utc"
-          @timezone = Time::Location.utc
+          @timezone = Time::Location::UTC
         when .starts_with? '-'
           raise ArgumentError.new "#{opt}: unknown option"
         when "add"
@@ -79,7 +79,7 @@ module Queue
           end
         end
       end
-      @dbfile = Path[DEFAULT_QUEUE_FILE].expand(home: true) if @dbfile == ""
+      @dbfile = Path[DEFAULT_QUEUE_FILE].expand(home: true).to_s if @dbfile == ""
       parent = Path[@dbfile].parent
       Dir.mkdir_p parent unless File.directory? parent
       @db = DB.open "sqlite3:#{@dbfile}?max_idle_pool_size=3&initial_pool_size=3&journal_mode=wal&busy_timeout=5000"
