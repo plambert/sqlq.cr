@@ -16,6 +16,7 @@ module Queue
     Run
     Delete
     Reset
+    Count
   end
 
   class CLI
@@ -53,19 +54,19 @@ module Queue
           @cmd = Command::Add
           @arguments = opts.dup
           opts = [] of String
-        when "list"
+        when "list", "l"
           @cmd = Command::List
           @arguments = opts.dup
           opts = [] of String
-        when "take", "get"
+        when "take", "get", "g", "t"
           @cmd = Command::Take
           @arguments = opts.dup
           opts = [] of String
-        when "peek"
+        when "peek", "p"
           @cmd = Command::Peek
           @arguments = opts.dup
           opts = [] of String
-        when "run"
+        when "run", "r"
           @cmd = Command::Run
           @arguments = opts.dup
           opts = [] of String
@@ -75,6 +76,10 @@ module Queue
           opts = [] of String
         when "reset"
           @cmd = Command::Reset
+          @arguments = opts.dup
+          opts = [] of String
+        when "count", "c"
+          @cmd = Command::Count
           @arguments = opts.dup
           opts = [] of String
         else
@@ -111,6 +116,8 @@ module Queue
         cmd_delete
       in Command::Reset
         cmd_reset
+      in Command::Count
+        cmd_count
       end
     end
 
@@ -168,8 +175,9 @@ module Queue
     end
 
     def cmd_peek
-      if next_entry = @db.query_one? "SELECT entry FROM \"#{@queue_name}\" ORDER BY creation_time, id LIMIT 1", as: String
-        puts next_entry
+      limit = @arguments[0]?.try(&.to_i64?) || 1
+      if entries = @db.query_all "SELECT id, creation_time, entry FROM \"#{@queue_name}\" ORDER BY creation_time, id LIMIT #{limit}", as: {Int64, Time, String}
+        entries.each { |entry| puts entry[2] }
       else
         STDERR.puts "no entries"
         exit 1
@@ -334,14 +342,19 @@ module Queue
         if results.empty?
           puts "no entries deleted"
         else
-          if 1 == results.size
-            puts "1 entry deleted"
-          else
-            puts "#{results.size} entries deleted"
-          end
           print_entries results
+          if 1 == results.size
+            STDERR.puts "1 entry deleted"
+          else
+            STDERR.puts "#{results.size} entries deleted"
+          end
         end
       end
+    end
+
+    def cmd_count
+      count = @db.query_one "SELECT COUNT(*) FROM \"#{@queue_name}\"", as: Int64
+      puts count
     end
 
     def cmd_reset
