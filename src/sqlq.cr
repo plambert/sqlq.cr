@@ -28,10 +28,12 @@ module Queue
     property cmd : Command
     property timezone : Time::Location
     property queue_name : String
+    property? quiet : Bool
 
     def initialize(@argv = ARGV.dup)
       opts = @argv.dup
       @arguments = [] of String
+      @quiet = false
       @cmd = Command::Help
       @timezone = Time::Location.local
       @queue_name = DEFAULT_QUEUE_NAME
@@ -48,6 +50,8 @@ module Queue
           @timezone = Time::Location::UTC
         when "--queue", "--queue-name", "-q"
           @queue_name = opts.shift? || raise ArgumentError.new "#{opt}: expected an argument"
+        when "--quiet", "-Q"
+          @quiet = true
         when .starts_with? '-'
           raise ArgumentError.new "#{opt}: unknown option"
         when "add"
@@ -132,16 +136,16 @@ module Queue
 
     def cmd_add
       if @arguments.empty?
-        STDERR.puts "nothing specified to add"
+        STDERR.puts "nothing specified to add" unless @quiet
       else
         creation_time = Time.local(location: @timezone)
         @arguments.each do |entry|
           @db.exec "INSERT INTO \"#{@queue_name}\" (entry, creation_time) VALUES (?, ?)", entry, creation_time
         end
         if 1 == @arguments.size
-          puts "1 entry added"
+          puts "1 entry added" unless @quiet
         else
-          puts "#{@arguments.size} entries added"
+          puts "#{@arguments.size} entries added" unless @quiet
         end
       end
     end
@@ -161,7 +165,7 @@ module Queue
       if deleted_entry = take?
         puts deleted_entry[2]
       else
-        STDERR.puts "no entries"
+        STDERR.puts "no entries" unless @quiet
         exit 1
       end
     end
@@ -179,7 +183,7 @@ module Queue
       if entries = @db.query_all "SELECT id, creation_time, entry FROM \"#{@queue_name}\" ORDER BY creation_time, id LIMIT #{limit}", as: {Int64, Time, String}
         entries.each { |entry| puts entry[2] }
       else
-        STDERR.puts "no entries"
+        STDERR.puts "no entries" unless @quiet
         exit 1
       end
     end
@@ -206,9 +210,6 @@ module Queue
       command = args.shift
       insert_index = args.index(":") || args.size
       args << ":" if insert_index == args.size
-      # args.each_with_index do |arg1, idx|
-      #   STDERR.printf "%s%3d %s\n", (idx == insert_index ? "*" : " "), idx, arg1
-      # end
       last_time = Time.monotonic
       while Time.monotonic - last_time <= timeout
         if entry = take?
@@ -231,7 +232,7 @@ module Queue
 
     def cmd_delete
       if @arguments.empty?
-        STDERR.puts "no entries to delete were given"
+        STDERR.puts "no entries to delete were given" unless @quiet
         exit 1
       end
       to_delete = [] of Range(Int64, Int64) | Range(Int64, Nil) | Range(Nil, Int64) | Regex | Range(Time, Time) | Range(Nil, Time) | Range(Time, Nil)
@@ -340,13 +341,13 @@ module Queue
 
         results = @db.query_all sql, args: where_args, as: {Int64, Time, String}
         if results.empty?
-          puts "no entries deleted"
+          STDERR.puts "no entries deleted" unless @quiet
         else
           print_entries results
           if 1 == results.size
-            STDERR.puts "1 entry deleted"
+            STDERR.puts "1 entry deleted" unless @quiet
           else
-            STDERR.puts "#{results.size} entries deleted"
+            STDERR.puts "#{results.size} entries deleted" unless @quiet
           end
         end
       end
@@ -361,7 +362,7 @@ module Queue
       count = @db.query_one "SELECT COUNT(*) FROM \"#{@queue_name}\"", as: Int64
 
       if count == 0
-        STDERR.puts "#{@dbfile}: queue #{@queue_name} is empty"
+        STDERR.puts "#{@dbfile}: queue #{@queue_name} is empty" unless @quiet
         return
       end
 
@@ -404,7 +405,7 @@ module Queue
           results = @db.query_all "DELETE FROM \"#{@queue_name}\" RETURNING id, creation_time, entry", as: {Int64, Time, String}
           print_entries results
         else
-          STDERR.puts "Reset aborted"
+          STDERR.puts "Reset aborted" unless @quiet
         end
       end
     end
