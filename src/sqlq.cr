@@ -1,5 +1,6 @@
 require "db"
 require "sqlite3"
+require "string_scanner"
 
 module Queue
   VERSION            = "0.1.0"
@@ -84,6 +85,7 @@ module Queue
           end
         end
       end
+      raise ArgumentError.new "#{@queue_name.inspect} is an invalid queue name" unless @queue_name =~ %r{\A[A-Za-z][A-Za-z0-9_]*\z}
       @dbfile = Path[DEFAULT_QUEUE_FILE].expand(home: true).to_s if @dbfile == ""
       parent = Path[@dbfile].parent
       Dir.mkdir_p parent unless File.directory? parent
@@ -149,11 +151,19 @@ module Queue
     end
 
     def cmd_take
-      if deleted_entry = @db.query_one? "DELETE FROM \"#{@queue_name}\" RETURNING entry ORDER BY creation_time, id LIMIT 1", as: String
-        puts deleted_entry
+      if deleted_entry = take?
+        puts deleted_entry[2]
       else
         STDERR.puts "no entries"
         exit 1
+      end
+    end
+
+    private def take? : {Int64, Time, String}?
+      if deleted_entry = @db.query_one? "DELETE FROM \"#{@queue_name}\" RETURNING id, creation_time, entry ORDER BY creation_time, id LIMIT 1", as: {Int64, Time, String}
+        deleted_entry
+      else
+        nil
       end
     end
 
@@ -167,7 +177,48 @@ module Queue
     end
 
     def cmd_run
-      raise RuntimeError.new "not implemented yet"
+      args = [] of String
+      timeout = 1.minute
+      retry_delay = 2.seconds
+      quit_on_error = true
+      while arg = @arguments.shift?
+        case arg
+        when "--timeout", "-t"
+          timeout_arg = @arguments.shift? || raise ArgumentError.new "#{arg}: expected an argument"
+          timeout = parse_relative_time(timeout_arg, negative: false)
+        when "--ignore-error", "-E"
+          quit_on_error = false
+        when "--no-ignore-error", "-e"
+          quit_on_error = true
+        else
+          args << arg
+        end
+      end
+      raise ArgumentError.new "run: expected a command and maybe arguments" if args.empty?
+      command = args.shift
+      insert_index = args.index(":") || args.size
+      args << ":" if insert_index == args.size
+      # args.each_with_index do |arg1, idx|
+      #   STDERR.printf "%s%3d %s\n", (idx == insert_index ? "*" : " "), idx, arg1
+      # end
+      last_time = Time.monotonic
+      while Time.monotonic - last_time <= timeout
+        if entry = take?
+          status = run_entry insert_index: insert_index, command: command, args: args, entry: entry
+          if quit_on_error && !status.success?
+            exit status.exit_code
+          end
+          last_time = Time.monotonic
+        else
+          sleep retry_delay
+        end
+      end
+    end
+
+    private def run_entry(*, insert_index : Int32, command : String, args : Array(String), entry : {Int64, Time, String})
+      new_args = args.dup
+      new_args[insert_index] = entry[2]
+      Process.run command: command, args: new_args, shell: false, output: STDOUT, error: STDERR
     end
 
     def cmd_delete
@@ -336,10 +387,12 @@ module Queue
                    reset_prompt io_in, io_out, count_described
                  end
 
-        exit unless agreed
-
-        results = @db.query_all "DELETE FROM \"#{@queue_name}\" RETURNING id, creation_time, entry", as: {Int64, Time, String}
-        print_entries results
+        if agreed
+          results = @db.query_all "DELETE FROM \"#{@queue_name}\" RETURNING id, creation_time, entry", as: {Int64, Time, String}
+          print_entries results
+        else
+          STDERR.puts "Reset aborted"
+        end
       end
     end
 
@@ -350,7 +403,7 @@ module Queue
         output << "This will remove #{count_described} from queue #{@queue_name} in #{@dbfile}, are you sure? (y/N) "
         begin
           reply = input.gets(chomp: true) || ""
-          output << '\n'
+          # output << '\n'
           case reply[0]?
           when 'y', 'Y'
             decision = true
@@ -360,6 +413,43 @@ module Queue
         end
       end
       decision
+    end
+
+    private def parse_relative_time(str, *, negative = true, ignore_sign = false) : Time::Span?
+      scan = StringScanner.new str
+      count : Int64 = 1
+      unit : Char = 's'
+      if scan.scan '-'
+        negative = true
+      elsif scan.scan '+'
+        negative = false
+      end
+      if scan.scan %r{\d+}
+        count = scan[0].to_i64
+      end
+      if scan.scan %r{[smhdw]}i
+        unit = scan[0].downcase[0]
+      end
+      span = case unit
+             when 's'
+               count.seconds
+             when 'm'
+               count.minutes
+             when 'h'
+               count.hours
+             when 'd'
+               count.days
+             when 'w'
+               count.weeks
+             else
+               raise ArgumentError.new "#{str}: could not parse time span unit"
+             end
+      span = span * -1 if negative && !ignore_sign
+      span
+    end
+
+    private def parse_relative_time(str, *, positive : Bool, ignore_sign = false) : Time::Span?
+      parse_relative_time(str, negative: !positive, ignore_sign: ignore_sign)
     end
 
     private def print_entry(entry : {Int64, Time, String})
