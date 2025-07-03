@@ -3,8 +3,8 @@ require "sqlite3"
 
 module Queue
   VERSION            = "0.1.0"
-  DEFAULT_QUEUE_NAME = "default_queue"
-  DEFAULT_QUEUE_FILE = "~/.cache/sqlq/default_queue"
+  DEFAULT_QUEUE_NAME = ENV["SQLQ_QUEUE_NAME"]? || "default_queue"
+  DEFAULT_QUEUE_FILE = ENV["SQLQ_QUEUE_FILE"]? || "~/.cache/sqlq/default_queue"
 
   enum Command
     Help
@@ -145,9 +145,7 @@ module Queue
         sql = "SELECT id, creation_time, entry FROM \"#{@queue_name}\" ORDER BY creation_time, id"
       end
       entries = @db.query_all sql, as: {Int64, Time, String}
-      entries.each do |entry|
-        printf "#{id_format} %s %s\n", entry[0], entry[1], entry[2]
-      end
+      print_entries entries
     end
 
     def cmd_take
@@ -290,14 +288,86 @@ module Queue
           else
             puts "#{results.size} entries deleted"
           end
-          results.each do |entry|
-            printf "#{id_format} %s %s\n", entry[0], entry[1], entry[2]
-          end
+          print_entries results
         end
       end
     end
 
     def cmd_reset
+      count = @db.query_one "SELECT COUNT(*) FROM \"#{@queue_name}\"", as: Int64
+
+      if count == 0
+        STDERR.puts "#{@dbfile}: queue #{@queue_name} is empty"
+        return
+      end
+
+      count_described = count == 1 ? "1 entry" : "all #{count} entries"
+
+      if @arguments[0]? != "--yes" && @arguments[0]? != "-y"
+        to_be_closed = [] of IO
+        io_out = if STDOUT.tty?
+                   STDOUT
+                 elsif STDERR.tty?
+                   STDERR
+                 else
+                   begin
+                     to_be_closed << File.open "/dev/tty", "w"
+                     to_be_closed[-1]
+                   rescue e : File::NotFoundError | File::AccessDeniedError
+                     STDERR
+                   end
+                 end
+        io_in = begin
+          to_be_closed << File.open "/dev/tty", "r"
+          to_be_closed[-1]
+        rescue e : File::NotFoundError | File::AccessDeniedError
+          STDIN
+        end
+
+        agreed = if io_in.responds_to? :cooked
+                   begin
+                     io_in.cooked do
+                       reset_prompt io_in, io_out, count_described
+                     end
+                   rescue e : IO::Error
+                     reset_prompt io_in, io_out, count_described
+                   end
+                 else
+                   reset_prompt io_in, io_out, count_described
+                 end
+
+        exit unless agreed
+
+        results = @db.query_all "DELETE FROM \"#{@queue_name}\" RETURNING id, creation_time, entry", as: {Int64, Time, String}
+        print_entries results
+      end
+    end
+
+    def reset_prompt(input, output, count_described) : Bool
+      reply = ""
+      decision : Bool? = nil
+      while decision.nil?
+        output << "This will remove #{count_described} from queue #{@queue_name} in #{@dbfile}, are you sure? (y/N) "
+        begin
+          reply = input.gets(chomp: true) || ""
+          output << '\n'
+          case reply[0]?
+          when 'y', 'Y'
+            decision = true
+          when 'n', 'N', Nil
+            decision = false
+          end
+        end
+      end
+      decision
+    end
+
+    private def print_entry(entry : {Int64, Time, String})
+      printf "#{id_format} %s %s\n", entry[0], entry[1], entry[2]
+    end
+
+    private def print_entries(entries : Array({Int64, Time, String}))
+      entries.each { |entry| print_entry(entry) }
     end
   end
 end
