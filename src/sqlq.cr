@@ -17,6 +17,7 @@ module Queue
     Delete
     Reset
     Count
+    Dedup
   end
 
   class CLI
@@ -86,6 +87,10 @@ module Queue
           @cmd = Command::Count
           @arguments = opts.dup
           opts = [] of String
+        when "dedupe", "dedup"
+          @cmd = Command::Dedup
+          @arguments = opts.dup
+          opts = [] of String
         else
           if @dbfile == ""
             @dbfile = opt
@@ -94,7 +99,7 @@ module Queue
           end
         end
       end
-      raise ArgumentError.new "#{@queue_name.inspect} is an invalid queue name" unless @queue_name =~ %r{\A[A-Za-z][A-Za-z0-9_]*\z}
+      validate_queue_name @queue_name
       @dbfile = Path[DEFAULT_QUEUE_FILE].expand(home: true).to_s if @dbfile == ""
       parent = Path[@dbfile].parent
       Dir.mkdir_p parent unless File.directory? parent
@@ -122,6 +127,8 @@ module Queue
         cmd_reset
       in Command::Count
         cmd_count
+      in Command::Dedup
+        cmd_dedup
       end
     end
 
@@ -134,18 +141,61 @@ module Queue
       "%" + max.to_s.size.to_s + "d"
     end
 
+    def cmd_dedup
+      entry_set = Set(String).new
+      delete_set = Set(Int64).new
+      @db.query "SELECT id, creation_time, entry FROM \"#{@queue_name}\" ORDER BY creation_time, id, entry" do |recordset|
+        recordset.each do
+          id = recordset.read(Int64)
+          recordset.read(Time)
+          entry = recordset.read(String)
+          unless entry_set.add? entry
+            delete_set.add id
+          end
+        end
+      end
+      if delete_set.size > 0
+        @db.exec "DELETE FROM \"#{@queue_name}\" WHERE id IN (#{delete_set.to_a.map(&.to_s).join(", ")})"
+        STDERR.puts "deleted #{delete_set.size} duplicate entries" unless @quiet
+      else
+        STDERR.puts "no duplicate entries" unless @quiet
+      end
+    end
+
     def cmd_add
-      if @arguments.empty?
+      unique = false
+      new_entries = [] of String
+      while arg = @arguments.shift?
+        case arg
+        when "--unique", "-u"
+          unique = true
+        when "--"
+          new_entries += @arguments
+          @arguments = [] of String
+        when .starts_with? '-'
+          raise ArgumentError.new "#{arg}: unknown argument"
+        else
+          new_entries << arg
+        end
+      end
+      if new_entries.empty?
         STDERR.puts "nothing specified to add" unless @quiet
       else
         creation_time = Time.local(location: @timezone)
-        @arguments.each do |entry|
-          @db.exec "INSERT INTO \"#{@queue_name}\" (entry, creation_time) VALUES (?, ?)", entry, creation_time
+        new_entries.each do |entry|
+          count = if unique
+                    @db.query_one "SELECT COUNT(id) FROM \"#{@queue_name}\" WHERE entry=?", entry, as: Int64
+                  else
+                    0
+                  end
+          if count == 0
+            @db.exec "INSERT INTO \"#{@queue_name}\" (entry, creation_time) VALUES (?, ?)", entry, creation_time
+          end
         end
-        if 1 == @arguments.size
+        if 1 == new_entries.size
           puts "1 entry added" unless @quiet
         else
-          puts "#{@arguments.size} entries added" unless @quiet
+          puts "#{new_entries.size} entries added" unless @quiet
         end
       end
     end
@@ -193,6 +243,7 @@ module Queue
       timeout = 1.minute
       retry_delay = 2.seconds
       quit_on_error = true
+      error_queue : String? = nil
       while arg = @arguments.shift?
         case arg
         when "--timeout", "-t"
@@ -202,6 +253,9 @@ module Queue
           quit_on_error = false
         when "--no-ignore-error", "-e"
           quit_on_error = true
+        when "--error-queue"
+          error_queue = @arguments.shift? || raise ArgumentError.new "#{arg}: expected an argument"
+          validate_queue_name error_queue
         else
           args << arg
         end
@@ -251,15 +305,9 @@ module Queue
           max = $2.to_i64
           raise ArgumentError.new "start of exclusive range #{min} is more than end of range #{max}" if min >= max
           to_delete << (min..(max - 1))
-        when %r{^([\-\+]?)(\d+)([sSmMhHdDwW])(?:\.\.|:)?$}
-          sign = case $1
-                 when "-", "+"
-                   $1
-                 else
-                   "-"
-                 end
-          count = $2.to_i64
-          unit = $3.upcase
+        when %r{^-?(\d+)([sSmMhHdDwW])(?:\.\.|:)?$}
+          count = $1.to_i64
+          unit = $2.upcase
           span = case unit
                  when "S"
                    count.seconds
@@ -472,6 +520,10 @@ module Queue
 
     private def print_entries(entries : Array({Int64, Time, String}))
       entries.each { |entry| print_entry(entry) }
+    end
+
+    private def validate_queue_name(str) : Nil
+      raise ArgumentError.new "#{str.inspect} is an invalid queue name" unless str =~ %r{\A[A-Za-z][A-Za-z0-9_]*\z}
     end
   end
 end
