@@ -18,7 +18,13 @@ module Queue
     Reset
     Count
     Dedup
+    CopyTo
+    BackupTo
+    RestoreFrom
+    MergeFrom
   end
+
+  alias EntryTuple = {Int64, Time, String}
 
   class CLI
     property argv : Array(String)
@@ -91,6 +97,18 @@ module Queue
           @cmd = Command::Dedup
           @arguments = opts.dup
           opts = [] of String
+        when "copy-to"
+          @cmd = Command::CopyTo
+          @arguments = opts.dup
+          opts = [] of String
+        when "backup-to"
+          @cmd = Command::BackupTo
+          @arguments = opts.dup
+          opts = [] of String
+        when "restore-from"
+          @cmd = Command::RestoreFrom
+          @arguments = opts.dup
+          opts = [] of String
         else
           if @dbfile == ""
             @dbfile = opt
@@ -104,7 +122,7 @@ module Queue
       parent = Path[@dbfile].parent
       Dir.mkdir_p parent unless File.directory? parent
       @db = DB.open "sqlite3:#{@dbfile}?max_idle_pool_size=3&initial_pool_size=3&journal_mode=wal&busy_timeout=5000"
-      @db.exec "CREATE TABLE IF NOT EXISTS \"#{@queue_name}\" (id INTEGER PRIMARY KEY, entry TEXT NOT NULL, creation_time TEXT NOT NULL)"
+      create_table @queue_name
     end
 
     def run
@@ -129,6 +147,14 @@ module Queue
         cmd_count
       in Command::Dedup
         cmd_dedup
+      in Command::CopyTo
+        cmd_copy_to
+      in Command::BackupTo
+        cmd_backup_to
+      in Command::RestoreFrom
+        cmd_restore_from
+      in Command::MergeFrom
+        cmd_merge_from
       end
     end
 
@@ -141,24 +167,90 @@ module Queue
       "%" + max.to_s.size.to_s + "d"
     end
 
+    private def copy_queue(from : String, to : String, truncate : Bool = false) : Int64
+      previous_count : Int64 = 0
+      subsequent_count : Int64 = 0
+      validate_queue_name from
+      validate_queue_name to
+      create_table to
+      table_count = @db.query_one "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", from, as: Int64
+      raise ArgumentError.new "#{from}: queue does not exist" if table_count == 0
+      @db.transaction do |trans|
+        previous_count = @db.query_one "SELECT COUNT(*) FROM \"#{to}\"", as: Int64
+        trans.connection.exec "DELETE FROM \"#{to}\"" if truncate
+        trans.connection.exec "INSERT OR IGNORE INTO \"#{to}\" SELECT * FROM \"#{from}\""
+        trans.connection.exec "INSERT INTO \"#{to}\" (creation_time, entry) SELECT creation_time, entry FROM \"#{from}\" WHERE id NOT IN (SELECT id FROM \"#{to}\")" unless truncate
+        subsequent_count = @db.query_one "SELECT COUNT(*) FROM \"#{to}\"", as: Int64
+      end
+      subsequent_count - previous_count
+    end
+
+    def cmd_copy_to
+      destination = @arguments.shift? || raise ArgumentError.new "copy-to requires an argument with the new queue name"
+      copy_queue from: @queue_name, to: destination
+    end
+
+    def cmd_backup_to
+      destination = @arguments.shift? || raise ArgumentError.new "copy-to requires an argument with the new queue name"
+      copy_queue from: @queue_name, to: destination, truncate: true
+    end
+
+    def cmd_restore_from
+      source = @arguments.shift? || raise ArgumentError.new "copy-to requires an argument with the new queue name"
+      copy_queue from: source, to: @queue_name, truncate: true
+    end
+
+    def cmd_merge_from
+      source = @arguments.shift? || raise ArgumentError.new "copy-to requires an argument with the new queue name"
+      copy_queue from: source, to: @queue_name
+    end
+
     def cmd_dedup
-      entry_set = Set(String).new
-      delete_set = Set(Int64).new
+      keep_oldest = true
+      while opt = @arguments.shift?
+        case opt
+        when "--oldest"
+          keep_oldest = true
+        when "--newest"
+          keep_oldest = false
+        else
+          raise ArgumentError.new "#{opt}: unknown option"
+        end
+      end
+      entries = Hash(String, {Int64, String}).new # map the entry string to the id and timestamp
+      ids_to_delete = Array(Int64).new
       @db.query "SELECT id, creation_time, entry FROM \"#{@queue_name}\" ORDER BY creation_time, id, entry" do |recordset|
         recordset.each do
           id = recordset.read(Int64)
-          recordset.read(Time)
+          timestamp = recordset.read(String)
           entry = recordset.read(String)
-          unless entry_set.add? entry
-            delete_set.add id
+          if existing = entries[entry]?
+            if compare_time_and_id existing: existing, other: {id, timestamp}, older: keep_oldest
+              ids_to_delete << id
+            else
+              ids_to_delete << existing[0]
+              entries[entry] = {id, timestamp}
+            end
+          else
+            entries[entry] = {id, timestamp}
           end
         end
       end
-      if delete_set.size > 0
-        @db.exec "DELETE FROM \"#{@queue_name}\" WHERE id IN (#{delete_set.to_a.map(&.to_s).join(", ")})"
-        STDERR.puts "deleted #{delete_set.size} duplicate entries" unless @quiet
+      if ids_to_delete.size > 0
+        @db.exec "DELETE FROM \"#{@queue_name}\" WHERE id IN (#{ids_to_delete.map(&.to_s).join(", ")})"
+        STDERR.puts "deleted #{ids_to_delete.size} duplicate entries" unless @quiet
       else
         STDERR.puts "no duplicate entries" unless @quiet
+      end
+    end
+
+    private def compare_time_and_id(existing, other, older = true)
+      if existing[1] < other[1]
+        older
+      elsif existing[1] == other[1] && existing[0] < other[0]
+        older
+      else
+        !older
       end
     end
 
@@ -207,7 +299,11 @@ module Queue
       else
         sql = "SELECT id, creation_time, entry FROM \"#{@queue_name}\" ORDER BY creation_time, id"
       end
-      entries = @db.query_all sql, as: {Int64, Time, String}
+      entries = @db.query_all sql, as: EntryTuple.types
+      # entries = Array(EntryTuple).new
+      # @db.query sql do |resultset|
+      #   entries << resultset.read(EntryTuple)
+      # end
       print_entries entries
     end
 
@@ -220,8 +316,8 @@ module Queue
       end
     end
 
-    private def take? : {Int64, Time, String}?
-      if deleted_entry = @db.query_one? "DELETE FROM \"#{@queue_name}\" RETURNING id, creation_time, entry ORDER BY creation_time, id LIMIT 1", as: {Int64, Time, String}
+    private def take? : EntryTuple?
+      if deleted_entry = @db.query_one? "DELETE FROM \"#{@queue_name}\" RETURNING id, creation_time, entry ORDER BY creation_time, id LIMIT 1", as: EntryTuple.types
         deleted_entry
       else
         nil
@@ -230,7 +326,7 @@ module Queue
 
     def cmd_peek
       limit = @arguments[0]?.try(&.to_i64?) || 1
-      if entries = @db.query_all "SELECT id, creation_time, entry FROM \"#{@queue_name}\" ORDER BY creation_time, id LIMIT #{limit}", as: {Int64, Time, String}
+      if entries = @db.query_all "SELECT id, creation_time, entry FROM \"#{@queue_name}\" ORDER BY creation_time, id LIMIT #{limit}", as: EntryTuple.types
         entries.each { |entry| puts entry[2] }
       else
         STDERR.puts "no entries" unless @quiet
@@ -256,6 +352,8 @@ module Queue
         when "--error-queue"
           error_queue = @arguments.shift? || raise ArgumentError.new "#{arg}: expected an argument"
           validate_queue_name error_queue
+        when "--no-error-queue"
+          error_queue = nil
         else
           args << arg
         end
@@ -265,11 +363,17 @@ module Queue
       insert_index = args.index(":") || args.size
       args << ":" if insert_index == args.size
       last_time = Time.monotonic
+      create_table error_queue if error_queue
       while Time.monotonic - last_time <= timeout
         if entry = take?
           status = run_entry insert_index: insert_index, command: command, args: args, entry: entry
-          if quit_on_error && !status.success?
-            exit status.exit_code
+          if !status.success?
+            if error_queue
+              @db.exec "INSERT INTO \"#{error_queue}\" (id, creation_time, entry) VALUES (?, ?, ?)", entry[0], entry[1], entry[2]
+            end
+            if quit_on_error
+              exit status.exit_code
+            end
           end
           last_time = Time.monotonic
         else
@@ -278,7 +382,7 @@ module Queue
       end
     end
 
-    private def run_entry(*, insert_index : Int32, command : String, args : Array(String), entry : {Int64, Time, String})
+    private def run_entry(*, insert_index : Int32, command : String, args : Array(String), entry : EntryTuple)
       new_args = args.dup
       new_args[insert_index] = entry[2]
       Process.run command: command, args: new_args, shell: false, output: STDOUT, error: STDERR
@@ -387,7 +491,7 @@ module Queue
                 "DELETE FROM \"#{@queue_name}\" WHERE " + where_clauses.join(" AND ") + " RETURNING id, creation_time, entry"
               end
 
-        results = @db.query_all sql, args: where_args, as: {Int64, Time, String}
+        results = @db.query_all sql, args: where_args, as: EntryTuple.types
         if results.empty?
           STDERR.puts "no entries deleted" unless @quiet
         else
@@ -450,7 +554,8 @@ module Queue
                  end
 
         if agreed
-          results = @db.query_all "DELETE FROM \"#{@queue_name}\" RETURNING id, creation_time, entry", as: {Int64, Time, String}
+          results = @db.query_all "DELETE FROM \"#{@queue_name}\" RETURNING id, creation_time, entry", as: EntryTuple.types
+
           print_entries results
         else
           STDERR.puts "Reset aborted" unless @quiet
@@ -514,16 +619,20 @@ module Queue
       parse_relative_time(str, negative: !positive, ignore_sign: ignore_sign)
     end
 
-    private def print_entry(entry : {Int64, Time, String})
+    private def print_entry(entry : EntryTuple)
       printf "#{id_format} %s %s\n", entry[0], entry[1], entry[2]
     end
 
-    private def print_entries(entries : Array({Int64, Time, String}))
+    private def print_entries(entries : Array(EntryTuple))
       entries.each { |entry| print_entry(entry) }
     end
 
     private def validate_queue_name(str) : Nil
       raise ArgumentError.new "#{str.inspect} is an invalid queue name" unless str =~ %r{\A[A-Za-z][A-Za-z0-9_]*\z}
+    end
+
+    private def create_table(table = @queue_name)
+      @db.exec "CREATE TABLE IF NOT EXISTS \"#{table}\" (id INTEGER PRIMARY KEY, entry TEXT NOT NULL, creation_time TEXT NOT NULL)"
     end
   end
 end
