@@ -17,9 +17,17 @@ setup() {
   fi
 }
 
-@test "gives error with status code 7 without any arguments" {
+@test "gives usage with status code 6 without any arguments" {
   run ./bin/sqlq
+  # change this when help text is written
   assert_output -p "no help available"
+  assert_failure 6
+}
+
+@test "has help text but returns success" {
+  skip "help is not implemented yet"
+  run ./bin/sqlq --help
+  assert_output -p "usage:"
   assert_success
 }
 
