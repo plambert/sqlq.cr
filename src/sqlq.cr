@@ -641,6 +641,7 @@ begin
   cli = Queue::CLI.new
   cli.run
 rescue e : ArgumentError
+  raise e if ENV["SQLQ_BACKTRACE"]?
   STDERR.puts "[ERROR] #{e}"
   exit 0
 end
