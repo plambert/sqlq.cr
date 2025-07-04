@@ -637,5 +637,10 @@ module Queue
   end
 end
 
-cli = Queue::CLI.new
-cli.run
+begin
+  cli = Queue::CLI.new
+  cli.run
+rescue e : ArgumentError
+  STDERR.puts "[ERROR] #{e}"
+  exit 0
+end
