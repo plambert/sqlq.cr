@@ -8,6 +8,7 @@ module Queue
   DEFAULT_QUEUE_FILE = ENV["SQLQ_QUEUE_FILE"]? || "~/.cache/sqlq/default_queue"
 
   enum Command
+    Unspecified
     Help
     Add
     List
@@ -23,6 +24,31 @@ module Queue
     RestoreFrom
     MergeFrom
   end
+
+  class QueueException < Exception
+    getter rc = 1
+  end
+
+  macro queue_exception(name, status_code, default_message)
+    class {{ name }} < QueueException
+      getter rc = {{ status_code }}
+      def initialize(@message = {{default_message}}, @rc = {{ status_code }}, for : String? = nil)
+        if for
+          @message="#{for}: #{@message}"
+        end
+        super(@message)
+      end
+    end
+  end
+
+  queue_exception QueueMissingArgumentError, 2, "expected an argument"
+  queue_exception QueueMissingCommandError, 3, "no command given"
+  queue_exception QueueMissingQueueError, 4, "queue does not exist"
+  queue_exception QueueNameError, 5, "invalid queue name"
+  queue_exception QueueNoHelpError, 6, "no help available"
+  queue_exception QueueRangeError, 7, "range start must be less than range end"
+  queue_exception QueueTimeParseError, 8, "cannot parse time"
+  queue_exception QueueUnknownOptionError, 9, "unknown option"
 
   alias EntryTuple = {Int64, Time, String}
 
@@ -41,26 +67,26 @@ module Queue
       opts = @argv.dup
       @arguments = [] of String
       @quiet = false
-      @cmd = Command::Help
+      @cmd = Command::Unspecified
       @timezone = Time::Location.local
       @queue_name = DEFAULT_QUEUE_NAME
       @dbfile = ""
       while opt = opts.shift?
         case opt
-        when "--help", "-h"
-          raise ArgumentError.new "no help available"
+        when "--help", "-h", "help"
+          raise QueueNoHelpError.new
         when "--file", "-f", "--db"
-          @dbfile = opts.shift? || raise ArgumentError.new "#{opt}: expected an argument"
+          @dbfile = opts.shift? || raise QueueMissingArgumentError.new for: opt
         when "--localtime"
           @timezone = Time::Location.local
         when "--utc"
           @timezone = Time::Location::UTC
         when "--queue", "--queue-name", "-q"
-          @queue_name = opts.shift? || raise ArgumentError.new "#{opt}: expected an argument"
+          @queue_name = opts.shift? || raise QueueMissingArgumentError.new for: opt
         when "--quiet", "-Q"
           @quiet = true
         when .starts_with? '-'
-          raise ArgumentError.new "#{opt}: unknown option"
+          raise QueueUnknownOptionError.new for: opt
         when "add"
           @cmd = Command::Add
           @arguments = opts.dup
@@ -113,7 +139,7 @@ module Queue
           if @dbfile == ""
             @dbfile = opt
           else
-            raise ArgumentError.new "#{opt}: expected a command add, list, take, get, peek, or run"
+            raise QueueMissingCommandError.new for: opt
           end
         end
       end
@@ -127,8 +153,14 @@ module Queue
 
     def run
       case @cmd
+      in Command::Unspecified
+        if @argv.empty?
+          raise QueueNoHelpError.new rc: 6
+        else
+          raise QueueMissingCommandError.new
+        end
       in Command::Help
-        raise ArgumentError.new "no help available"
+        raise QueueNoHelpError.new
       in Command::Add
         cmd_add
       in Command::List
@@ -174,7 +206,7 @@ module Queue
       validate_queue_name to
       create_table to
       table_count = @db.query_one "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", from, as: Int64
-      raise ArgumentError.new "#{from}: queue does not exist" if table_count == 0
+      raise QueueMissingQueueError.new for: from if table_count == 0
       @db.transaction do |trans|
         previous_count = @db.query_one "SELECT COUNT(*) FROM \"#{to}\"", as: Int64
         trans.connection.exec "DELETE FROM \"#{to}\"" if truncate
@@ -186,22 +218,22 @@ module Queue
     end
 
     def cmd_copy_to
-      destination = @arguments.shift? || raise ArgumentError.new "copy-to requires an argument with the new queue name"
+      destination = @arguments.shift? || raise QueueMissingArgumentError.new "copy-to requires an argument with the new queue name"
       copy_queue from: @queue_name, to: destination
     end
 
     def cmd_backup_to
-      destination = @arguments.shift? || raise ArgumentError.new "copy-to requires an argument with the new queue name"
+      destination = @arguments.shift? || raise QueueMissingArgumentError.new "backup-to requires an argument with the new queue name"
       copy_queue from: @queue_name, to: destination, truncate: true
     end
 
     def cmd_restore_from
-      source = @arguments.shift? || raise ArgumentError.new "copy-to requires an argument with the new queue name"
+      source = @arguments.shift? || raise QueueMissingArgumentError.new "restore-from requires an argument with the new queue name"
       copy_queue from: source, to: @queue_name, truncate: true
     end
 
     def cmd_merge_from
-      source = @arguments.shift? || raise ArgumentError.new "copy-to requires an argument with the new queue name"
+      source = @arguments.shift? || raise QueueMissingArgumentError.new "merge-from requires an argument with the new queue name"
       copy_queue from: source, to: @queue_name
     end
 
@@ -214,7 +246,7 @@ module Queue
         when "--newest"
           keep_oldest = false
         else
-          raise ArgumentError.new "#{opt}: unknown option"
+          raise QueueUnknownOptionError.new for: opt
         end
       end
       entries = Hash(String, {Int64, String}).new # map the entry string to the id and timestamp
@@ -265,7 +297,7 @@ module Queue
           new_entries += @arguments
           @arguments = [] of String
         when .starts_with? '-'
-          raise ArgumentError.new "#{arg}: unknown argument"
+          raise QueueUnknownOptionError.new for: arg
         else
           new_entries << arg
         end
@@ -343,14 +375,14 @@ module Queue
       while arg = @arguments.shift?
         case arg
         when "--timeout", "-t"
-          timeout_arg = @arguments.shift? || raise ArgumentError.new "#{arg}: expected an argument"
+          timeout_arg = @arguments.shift? || raise QueueMissingArgumentError.new for: arg
           timeout = parse_relative_time(timeout_arg, negative: false)
         when "--ignore-error", "-E"
           quit_on_error = false
         when "--no-ignore-error", "-e"
           quit_on_error = true
         when "--error-queue"
-          error_queue = @arguments.shift? || raise ArgumentError.new "#{arg}: expected an argument"
+          error_queue = @arguments.shift? || raise QueueMissingArgumentError.new for: arg
           validate_queue_name error_queue
         when "--no-error-queue"
           error_queue = nil
@@ -358,7 +390,7 @@ module Queue
           args << arg
         end
       end
-      raise ArgumentError.new "run: expected a command and maybe arguments" if args.empty?
+      raise QueueMissingArgumentError.new "run: expected a command and maybe arguments" if args.empty?
       command = args.shift
       insert_index = args.index(":") || args.size
       args << ":" if insert_index == args.size
@@ -402,12 +434,12 @@ module Queue
         when %r{^(\d+)(?:\.\.|:|-)(\d+)$}
           min = $1.to_i64
           max = $2.to_i64
-          raise ArgumentError.new "start of range #{min} is more than end of range #{max}" if min > max
+          raise QueueRangeError.new for: "#{min} .. #{max}" if min > max
           to_delete << (min..max)
         when %r{^(\d+)\.\.\.(\d+)$}
           min = $1.to_i64
           max = $2.to_i64
-          raise ArgumentError.new "start of exclusive range #{min} is more than end of range #{max}" if min >= max
+          raise QueueRangeError.new for: "#{min} .. #{max}" if min >= max
           to_delete << (min..(max - 1))
         when %r{^-?(\d+)([sSmMhHdDwW])(?:\.\.|:)?$}
           count = $1.to_i64
@@ -424,7 +456,7 @@ module Queue
                  when "W"
                    count.weeks
                  else
-                   raise ArgumentError.new "#{unit}: cannot parse time unit"
+                   raise QueueTimeParseError.new for: unit
                  end
           to_delete << ((Time.local(location: @timezone) - span)..)
         when %r{^(\d\d\d\d-\d\d-\d\d)(?:\.\.|\s+TO\s+(\d\d\d\d-\d\d-\d\d))?$}
@@ -438,7 +470,7 @@ module Queue
         when %r{(?s)\A/(.*)/\z}
           to_delete << Regex.new $1
         else
-          raise ArgumentError.new "#{arg}: cannot parse argument to delete"
+          raise QueueUnknownOptionError.new for: arg
         end
       end
 
@@ -609,7 +641,7 @@ module Queue
              when 'w'
                count.weeks
              else
-               raise ArgumentError.new "#{str}: could not parse time span unit"
+               raise QueueTimeParseError.new for: str.inspect
              end
       span = span * -1 if negative && !ignore_sign
       span
@@ -628,7 +660,7 @@ module Queue
     end
 
     private def validate_queue_name(str) : Nil
-      raise ArgumentError.new "#{str.inspect} is an invalid queue name" unless str =~ %r{\A[A-Za-z][A-Za-z0-9_]*\z}
+      raise QueueNameError.new for: str.inspect unless str =~ %r{\A[A-Za-z][A-Za-z0-9_]*\z}
     end
 
     private def create_table(table = @queue_name)
@@ -640,8 +672,14 @@ end
 begin
   cli = Queue::CLI.new
   cli.run
-rescue e : ArgumentError
+rescue e : Queue::QueueException
   raise e if ENV["SQLQ_BACKTRACE"]?
-  STDERR.puts "[ERROR] #{e}"
-  exit 0
+  if STDERR.tty?
+    STDERR.print "\e[31;1m[ERROR]\e[0m"
+  else
+    STDERR.print "[ERROR]"
+  end
+  STDERR << ' '
+  STDERR.puts e
+  exit e.rc
 end

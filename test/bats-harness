@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+# wrapper for bats
+
+set -e -o pipefail
+
+cd "$(dirname -- "${BASH_SOURCE[0]}")/.."
+
+if [[ ! -x ./test/bats/bin/bats ]]; then
+  printf 1>&2 '\e[31;1m[ERROR]\e[0m could not find ./test/bats/bin/bats from project directory\n'
+  exit 1
+fi
+
+if [[ $# -eq 0 ]]; then
+  set -- ./test/*.bats
+fi
+
+exec ./test/bats/bin/bats "$@"
+
