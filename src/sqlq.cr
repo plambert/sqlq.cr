@@ -5,7 +5,7 @@ require "string_scanner"
 module Queue
   VERSION            = "0.1.0"
   DEFAULT_QUEUE_NAME = ENV["SQLQ_QUEUE_NAME"]? || "default_queue"
-  DEFAULT_QUEUE_FILE = ENV["SQLQ_QUEUE_FILE"]? || "~/.cache/sqlq/default_queue"
+  DEFAULT_QUEUE_FILE = ENV["SQLQ_QUEUE_FILE"]? || "~/.cache/sqlq/default_queue.sqlite3"
 
   enum Command
     Unspecified
